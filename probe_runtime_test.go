@@ -1658,6 +1658,95 @@ func TestProbeRecoveryFailureContinuesOtherConfirmedInstance(t *testing.T) {
 	}
 }
 
+func TestScheduledProbeCycleRecoversSentUnknownWithoutRestartOrResend(t *testing.T) {
+	now := time.Date(2026, 8, 19, 8, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	idToken := makeUnsignedJWT(t, map[string]any{"chatgpt_account_id": "acct"})
+	active := []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":%q}}}`, now.Add(7*24*time.Hour).Format(time.RFC3339)))
+	host := &sequenceProbeHost{
+		auth:  pluginapi.HostAuthGetResponse{AuthIndex: "idx", Name: "a.json", JSON: json.RawMessage(`{"access_token":"access","id_token":"` + idToken + `"}`)},
+		quota: [][]byte{active},
+	}
+	cfg := DefaultConfig()
+	cfg.EnableResetProbe = true
+	state := NewPluginState(cfg)
+	roster := HostRosterSnapshot{Capability: CapabilityA, Entries: []RosterEntry{{ID: "a", AuthIndex: "idx", Provider: "codex", Priority: intPtr(9)}}}
+	path := filepath.Join(t.TempDir(), "state.json")
+	adapter := &rosterCredentialHost{host: host, roster: roster}
+	r, err := NewProductionQuotaRefresher(host, state, adapter, roster, path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.bindings = r.bindings
+	binding, _, err := r.BootstrapBinding(context.Background(), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendFence, err := r.probeFence.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := ProbeWindow{
+		State:     ProbeSentUnknown,
+		Baseline:  ResetProbeBaseline(now.Add(-time.Hour), 0, 7*24*time.Hour),
+		Deadline:  now,
+		AttemptID: "stuck",
+	}
+	attempt := ProbeAttempt{
+		Instance:        binding.Instance,
+		AttemptID:       "stuck",
+		Windows:         []ProbeWindowKind{ProbeWindowLong},
+		Phase:           ProbeAttemptSentUnknown,
+		SendFenceSeq:    sendFence,
+		CreatedAt:       now.Add(-time.Hour),
+		VerifyNotBefore: now.Add(-time.Minute),
+		SuppressUntil:   now.Add(-time.Minute),
+	}
+	if _, err = r.runtimeStore.Update(func(s *PersistentState) error {
+		s.ProbeAttemptSeq = 7
+		s.ProbeWindows[binding.Instance] = map[ProbeWindowKind]ProbeWindow{ProbeWindowLong: window}
+		s.ProbeAttempts[binding.Instance] = attempt
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.probeController.SetWindow(binding.Instance, ProbeWindowLong, window)
+
+	refresherMu.Lock()
+	previousRosterController := globalRosterController
+	globalRosterController = nil
+	refresherMu.Unlock()
+	t.Cleanup(func() {
+		refresherMu.Lock()
+		globalRosterController = previousRosterController
+		refresherMu.Unlock()
+	})
+
+	recoveryErr, dueErr := r.runProbeCycle(context.Background())
+	if recoveryErr != nil || dueErr != nil {
+		t.Fatalf("scheduled cycle errors: recovery=%v due=%v", recoveryErr, dueErr)
+	}
+	snapshot, err := r.runtimeStore.PersistentSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.ProbeAttempts) != 0 {
+		t.Fatalf("SentUnknown attempt survived scheduled recovery: %#v", snapshot.ProbeAttempts)
+	}
+	if snapshot.ProbeAttemptSeq != 7 {
+		t.Fatalf("scheduled recovery claimed a new send attempt: seq=%d", snapshot.ProbeAttemptSeq)
+	}
+	host.mu.Lock()
+	urls := append([]string(nil), host.urls...)
+	host.mu.Unlock()
+	if len(urls) != 1 || urls[0] == codexResetProbeEndpoint {
+		t.Fatalf("recovery resent compact instead of performing one quota read: %v", urls)
+	}
+	recovered, ok := r.probeController.Window(binding.Instance, ProbeWindowLong)
+	if !ok || recovered.State != ProbeWaitingReset || !recovered.Deadline.After(now) {
+		t.Fatalf("recovered window = %#v", recovered)
+	}
+}
+
 func TestProductionProbeHasNoSplitSendExecutor(t *testing.T) {
 	raw, err := os.ReadFile("probe_runtime.go")
 	if err != nil {

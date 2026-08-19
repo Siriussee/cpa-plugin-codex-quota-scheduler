@@ -1190,7 +1190,7 @@ func (r *QuotaRefresher) Start() {
 	r.stopping = false
 	r.mu.Unlock()
 	if r.probeController != nil {
-		r.launchProbe(true)
+		r.launchProbe()
 	}
 
 	go func() {
@@ -1214,7 +1214,7 @@ func (r *QuotaRefresher) Start() {
 				r.refreshController.OnDeadline(r.now())
 				r.RefreshDueSoon()
 				if r.probeController != nil {
-					r.launchProbe(false)
+					r.launchProbe()
 				}
 			case <-wake:
 				if timer != nil && !timer.Stop() {
@@ -1236,7 +1236,26 @@ func (r *QuotaRefresher) Start() {
 	}()
 }
 
-func (r *QuotaRefresher) launchProbe(recoverFirst bool) {
+func (r *QuotaRefresher) recordProbeLoopFailure(event, message string, err error) {
+	if err == nil {
+		return
+	}
+	fields := map[string]any{"error": redactSecrets(err.Error())}
+	if r.state != nil {
+		r.state.RecordLog("warn", event, message, fields, r.now())
+	}
+	if r.host != nil {
+		r.host.Log("warn", message, fields)
+	}
+}
+
+func (r *QuotaRefresher) runProbeCycle(ctx context.Context) (error, error) {
+	recoveryErr := r.RunProbeRecoveryOnce(ctx)
+	dueErr := r.RunProbeDueOnce(ctx)
+	return recoveryErr, dueErr
+}
+
+func (r *QuotaRefresher) launchProbe() {
 	r.mu.Lock()
 	if r.stopping {
 		r.mu.Unlock()
@@ -1246,10 +1265,9 @@ func (r *QuotaRefresher) launchProbe(recoverFirst bool) {
 	r.mu.Unlock()
 	go func() {
 		defer r.wg.Done()
-		if recoverFirst {
-			_ = r.RunProbeRecoveryOnce(context.Background())
-		}
-		_ = r.RunProbeDueOnce(context.Background())
+		recoveryErr, dueErr := r.runProbeCycle(context.Background())
+		r.recordProbeLoopFailure("probe.recovery_failed", "Probe recovery failed; a read-only retry remains scheduled", recoveryErr)
+		r.recordProbeLoopFailure("probe.due_failed", "Probe due cycle failed; it will retry on a later deadline", dueErr)
 	}()
 }
 

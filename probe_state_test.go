@@ -46,6 +46,16 @@ func TestProbeControllerDormantDeadlineStillEmitsProbe(t *testing.T) {
 	}
 }
 
+func TestProbeControllerSentUnknownDeadlineSchedulesReadOnlyRecovery(t *testing.T) {
+	now := time.Unix(2500, 0).UTC()
+	c := NewProbeController(now)
+	c.SetWindow(1, ProbeWindowLong, ProbeWindow{State: ProbeSentUnknown, Deadline: now.Add(time.Minute)})
+	c.SetWindow(2, ProbeWindowLong, ProbeWindow{State: ProbeWaitingReset, Deadline: now.Add(2 * time.Minute)})
+	if got := c.NextDeadline(); !got.Equal(now.Add(time.Minute)) {
+		t.Fatalf("SentUnknown recovery deadline = %s", got)
+	}
+}
+
 func TestKnownResetDeadlineIncludesExternalResetObservation(t *testing.T) {
 	now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
 	base := ResetProbeBaseline(now.Add(5*time.Hour), 40, 5*time.Hour)

@@ -87,7 +87,7 @@ func (c *ProbeController) NextDeadline() time.Time {
 	var out time.Time
 	for _, ws := range c.windows {
 		for _, w := range ws {
-			if w.State != ProbeWaitingReset && w.State != ProbeRetryWait && w.State != ProbeAnomalyHold {
+			if w.State != ProbeWaitingReset && w.State != ProbeSentUnknown && w.State != ProbeRetryWait && w.State != ProbeAnomalyHold {
 				continue
 			}
 			if !w.Deadline.IsZero() && (out.IsZero() || w.Deadline.Before(out)) {
